@@ -15,6 +15,7 @@ import json
 import math
 import time
 import logging
+import threading
 import requests
 import pandas as pd
 from datetime import datetime, timedelta
@@ -102,7 +103,6 @@ def get_ltp():
     url = f"{UPSTOX_V3}/market-quote/ltp?instrument_key={NIFTY_KEY_ENC}"
     data = upstox_get(url)
     if data:
-        # FIX 1: Dynamic key — don't hardcode response key
         first = next(iter(data.values()), None)
         if first and "last_price" in first:
             ltp = float(first["last_price"])
@@ -121,7 +121,6 @@ def fetch_historical(unit, interval, candles_needed):
     now     = datetime.now(IST)
     to_date = now.strftime("%Y-%m-%d")
 
-    # FIX 2: Hourly from_date was too short (40hrs not enough for 30 candles)
     if unit == "weeks":
         from_date = (now - timedelta(weeks=candles_needed + 5)).strftime("%Y-%m-%d")
     elif unit == "days":
@@ -238,7 +237,6 @@ def pre_calculate(weekly_df, daily_df):
     if daily_df.empty or weekly_df.empty:
         return {}
 
-    # Len guard — prevent iloc[-2] crash
     if len(daily_df) < 3 or len(weekly_df) < 3:
         log.warning(
             f"pre_calculate: not enough candles "
@@ -247,33 +245,27 @@ def pre_calculate(weekly_df, daily_df):
         return {}
 
     try:
-        # FIX 3: Check if last daily candle is today (incomplete) or yesterday
         today_date = datetime.now(IST).date()
         last_ts    = pd.to_datetime(daily_df.iloc[-1]["ts"])
         last_date  = last_ts.date() if hasattr(last_ts, 'date') else today_date
 
         if last_date == today_date:
-            # API ne aajchi incomplete candle dili — prev = iloc[-2]
             prev_row    = daily_df.iloc[-2]
             current_row = daily_df.iloc[-1]
             log.info("Daily: today's candle detected → using iloc[-2] as prev day")
         else:
-            # API ne sirf yesterday paryant dili — prev = iloc[-1]
             prev_row    = daily_df.iloc[-1]
             current_row = daily_df.iloc[-1]
             log.info("Daily: no today's candle → using iloc[-1] as prev day")
 
-        # Previous Day
         pdh = int(prev_row["h"])
         pdl = int(prev_row["l"])
         pdc = int(prev_row["c"])
 
-        # Previous Week
         pwh = int(weekly_df.iloc[-2]["h"])
         pwl = int(weekly_df.iloc[-2]["l"])
         pwc = int(weekly_df.iloc[-2]["c"])
 
-        # 50-day range
         last50     = daily_df.tail(50)
         range_high = int(last50["h"].max())
         range_low  = int(last50["l"].min())
@@ -282,10 +274,8 @@ def pre_calculate(weekly_df, daily_df):
         range_pct  = round((current - range_low) /
                            max(range_high - range_low, 1) * 100, 1)
 
-        # Is market ranging? (range < 8% of price)
         is_ranging = (range_high - range_low) < (range_high * 0.08)
 
-        # Swing High/Low
         swing_h = int(last50["h"].max())
         swing_l = int(last50["l"].min())
 
@@ -320,19 +310,17 @@ def build_morning_string(tf_data):
     d_old    = d.head(DAILY_OLD)
     d_recent = d.tail(DAILY_RECENT)
 
-    # Bases
     w_base   = get_base(w)
     d_base   = get_base(d)
     h_base   = get_base(h)
     m15_base = get_base(m15)
 
-    # Compress
-    w_str   = compress_hl(w, w_base)       if not w.empty   else "N/A"
-    do_str  = compress_hl(d_old, d_base)   if not d_old.empty else "N/A"
+    w_str   = compress_hl(w, w_base)          if not w.empty    else "N/A"
+    do_str  = compress_hl(d_old, d_base)      if not d_old.empty else "N/A"
     dr_str  = compress_ohlc(d_recent, d_base) if not d_recent.empty else "N/A"
-    h_str   = compress_ohlc(h, h_base)     if not h.empty   else "N/A"
-    m15_str = compress_ohlc(m15, m15_base) if not m15.empty else "N/A"
-    m5_str  = compress_ohlc(m5, d_base)    if not m5.empty  else "N/A"
+    h_str   = compress_ohlc(h, h_base)        if not h.empty    else "N/A"
+    m15_str = compress_ohlc(m15, m15_base)    if not m15.empty  else "N/A"
+    m5_str  = compress_ohlc(m5, d_base)       if not m5.empty   else "N/A"
 
     c = calc
     today = datetime.now(IST).strftime("%d-%m-%Y")
@@ -401,14 +389,12 @@ def build_intraday_string(tf_data, morning_ctx, current_price, state):
     m15 = tf_data["m15"].tail(INTRADAY_M15)
     m5  = tf_data["m5"].tail(INTRADAY_M5)
 
-    # Drop incomplete candles before sending to AI
     m15 = drop_incomplete_candle(m15, interval_minutes=15)
     m5  = drop_incomplete_candle(m5,  interval_minutes=5)
 
     if m15.empty or m5.empty:
         return None
 
-    # Base from combined min
     combined_min = min(
         m15["l"].min() if not m15.empty else 99999,
         m5["l"].min()  if not m5.empty  else 99999
@@ -418,7 +404,6 @@ def build_intraday_string(tf_data, morning_ctx, current_price, state):
     m15_str = compress_ohlc(m15, base)
     m5_str  = compress_ohlc(m5,  base)
 
-    # Key levels from morning context (top 3 R + 3 S)
     levels = morning_ctx.get("levels", [])
     r_levels = [l for l in levels if l["type"] == "R"][:3]
     s_levels = [l for l in levels if l["type"] == "S"][:3]
@@ -427,7 +412,6 @@ def build_intraday_string(tf_data, morning_ctx, current_price, state):
     s_str = " | ".join([f"S{i+1}:{l['price']}[{l['strength'][0]}]"
                         for i, l in enumerate(s_levels)])
 
-    # Signal history (last 3)
     history = get_signal_history()
     hist_str = "NONE"
     if history:
@@ -474,7 +458,6 @@ NearLevel:{near_level}[{lvl_strength}] | Time:{now_str}
 # SECTION 4: REDIS BRAIN
 # ═══════════════════════════════════════════════════════
 
-# Fallback: in-memory dict (if Redis not available)
 _memory = {}
 
 def _redis_client():
@@ -491,6 +474,11 @@ if _r:
     log.info("✅ Redis connected")
 else:
     log.warning("⚠️  Redis unavailable — using RAM mode")
+
+
+# ── CHANGE 3: redis_status helper ────────────────────
+def redis_status():
+    return "connected" if _r else "RAM mode"
 
 
 def _set(key, value, ttl=86400):
@@ -569,7 +557,6 @@ def detect_price_state(current_price, morning_ctx):
     levels    = morning_ctx.get("levels", [])
     liq       = morning_ctx.get("liquidity", {})
 
-    # Check S/R levels
     for lvl in levels:
         price    = lvl["price"]
         strength = lvl["strength"]
@@ -579,14 +566,12 @@ def detect_price_state(current_price, morning_ctx):
             state = "AT_RESISTANCE" if ltype == "R" else "AT_SUPPORT"
             return (state, price, strength)
 
-        # Breakout zone (just crossed)
         if ltype == "R" and price < current_price < price * 1.005:
             return ("BREAKOUT_ZONE", price, strength)
 
         if ltype == "S" and price * 0.995 < current_price < price:
             return ("BREAKDOWN_ZONE", price, strength)
 
-    # Check liquidity pools
     pool_above = liq.get("pool_above", 0)
     pool_below = liq.get("pool_below", 0)
 
@@ -601,30 +586,24 @@ def detect_price_state(current_price, morning_ctx):
 
 def should_call_ai(state, morning_ctx):
     """Decide whether to call AI — saves tokens"""
-    now  = datetime.now(IST)
-    hour = now.hour
+    now    = datetime.now(IST)
+    hour   = now.hour
     minute = now.minute
 
-    # Market not fully open yet — wait till 9:25
-    # (9:20 = morning context build, 9:25 = first signal scan)
     if hour == 9 and minute < 25:
         return False, "Opening wait (before 9:25)"
 
-    # Market closing soon — no new trades
     if hour == 15 and minute > 15:
         return False, "Market closing"
 
-    # Active signal already running
     active = get_active_signal()
     if active and active.get("status") == "OPEN":
         return False, "Active signal exists"
 
-    # Max daily signals reached
     history = get_signal_history()
     if len(history) >= MAX_DAY_SIGNALS:
         return False, "Max signals reached"
 
-    # Skip sideways / no setup
     call_states = [
         "AT_SUPPORT", "AT_RESISTANCE",
         "BREAKOUT_ZONE", "BREAKDOWN_ZONE",
@@ -633,8 +612,6 @@ def should_call_ai(state, morning_ctx):
     if state[0] not in call_states:
         return False, f"State: {state[0]} — skip"
 
-    # FIX 8: Same level already analyzed? → track state+level together
-    # e.g. AT_SUPPORT_24480 vs BREAKOUT_ZONE_24480 → different setups!
     already_analyzed = [
         f"{s.get('state', '')}_{s.get('level', 0)}"
         for s in history
@@ -666,21 +643,19 @@ def track_active_signal(current_price):
     t1_hit  = sig.get("t1_hit", False)
     entry   = sig["entry"]
 
-    # ── BUY checks ───────────────────────────────────
     if stype == "STRONG_BUY":
         if current_price <= sl:
             return _close_signal(sig, "SL_HIT")
 
         if not t1_hit and current_price >= t1:
             sig["t1_hit"] = True
-            sig["sl"]     = entry      # Trail SL to entry
+            sig["sl"]     = entry
             save_active_signal(sig)
             return {"event": "T1_HIT", "signal": sig}
 
         if t1_hit and current_price >= t2:
             return _close_signal(sig, "TARGET_HIT")
 
-    # ── SELL checks ──────────────────────────────────
     elif stype == "STRONG_SELL":
         if current_price >= sl:
             return _close_signal(sig, "SL_HIT")
@@ -694,15 +669,12 @@ def track_active_signal(current_price):
         if t1_hit and current_price <= t2:
             return _close_signal(sig, "TARGET_HIT")
 
-    # ── Expiry check ─────────────────────────────────
     try:
         created_at = sig.get("created_at")
 
         if created_at:
-            # created_at available → use ISO format (accurate)
             sig_time = datetime.fromisoformat(created_at)
         else:
-            # Fallback → HH:MM string parse
             sig_time = datetime.strptime(
                 sig["time"], "%H:%M"
             ).replace(
@@ -747,7 +719,7 @@ def save_new_signal(ai_resp, level, current_price, state_name=""):
         "level":      level,
         "state":      state_name,
         "time":       datetime.now(IST).strftime("%H:%M"),
-        "created_at": datetime.now(IST).isoformat(),   # Fix 5
+        "created_at": datetime.now(IST).isoformat(),
         "status":     "OPEN",
         "t1_hit":     False
     }
@@ -861,11 +833,9 @@ def parse_ai_response(raw_text):
     if not raw_text:
         return None
     try:
-        # Clean markdown fences if any
         clean = raw_text.strip()
         clean = clean.replace("```json", "").replace("```", "").strip()
 
-        # Find JSON boundaries
         start = clean.find("{")
         end   = clean.rfind("}") + 1
         if start == -1 or end == 0:
@@ -878,12 +848,11 @@ def parse_ai_response(raw_text):
         return None
 
 
-# FIX 5: AI signal numbers validate karo — wrong SL/Target reject
 def validate_signal(ai, current_price):
     """
     BUY:  SL < Entry < T1 < T2
     SELL: SL > Entry > T1 > T2
-    Entry must be within 0.5% of current price
+    Entry must be within MAX_ENTRY_DIST pts of current price
     """
     try:
         sig   = ai.get("signal", "")
@@ -892,7 +861,6 @@ def validate_signal(ai, current_price):
         t1    = float(ai.get("target1") or 0)
         t2    = float(ai.get("target2") or 0)
 
-        # Entry must be close to current price (env configurable)
         entry_diff_pts = abs(entry - current_price)
         if entry_diff_pts > MAX_ENTRY_DIST:
             log.warning(f"Signal rejected: entry {entry} too far from LTP {current_price} ({entry_diff_pts:.0f} pts > {MAX_ENTRY_DIST})")
@@ -914,7 +882,6 @@ def validate_signal(ai, current_price):
         return False
 
 
-# FIX 6: Risk-Reward filter — minimum 1:1.5 RR required
 def rr_ok(ai):
     """Minimum 1:1.5 Risk-Reward check"""
     try:
@@ -950,7 +917,6 @@ def confirmation_ok(ai):
     except Exception:
         count = len(confirmations)
 
-    # Fake placeholder words AI kadhi deto — reject them
     fake_words = {
         "reason1", "reason2", "reason3", "reason4", "reason5",
         "none", "na", "n/a", "null", "factor1", "factor2",
@@ -961,7 +927,7 @@ def confirmation_ok(ai):
         str(c).strip().lower()
         for c in confirmations
         if str(c).strip().lower() not in fake_words
-        and len(str(c).strip()) > 5   # min 5 chars = real reason
+        and len(str(c).strip()) > 5
     ]
 
     if count < 3 or len(clean) < 3:
@@ -987,7 +953,6 @@ def get_last_completed_m5_candle(tf_data, buffer_seconds=10):
     """
     Return last COMPLETED 5min candle.
     If latest candle still forming → use previous one.
-    9:25 candle complete at 9:30:10 (5min + 10sec buffer)
     """
     m5 = tf_data.get("m5", pd.DataFrame())
     if m5.empty:
@@ -1002,7 +967,6 @@ def get_last_completed_m5_candle(tf_data, buffer_seconds=10):
         log.info(f"✅ Latest 5m candle complete: {last_ts.strftime('%H:%M')}")
         return last
 
-    # Still forming → use previous completed candle
     if len(m5) >= 2:
         prev    = m5.iloc[-2]
         prev_ts = _to_ist_datetime(prev["ts"])
@@ -1021,7 +985,6 @@ def candle_close_ok(tf_data, signal_type):
     Last COMPLETED 5m candle must confirm signal direction.
     BUY  → close > open (bullish candle)
     SELL → close < open (bearish candle)
-    Uses get_last_completed_m5_candle() — not raw last row.
     """
     try:
         candle = get_last_completed_m5_candle(tf_data)
@@ -1109,7 +1072,6 @@ ANALYZE and return ONLY this JSON:
     result = parse_ai_response(raw)
 
     if result:
-        # FIX 4: calc pn Redis madhe save — intraday la PDH/PDL milel
         result["_calc"] = calc
         save_morning_context(result)
         log.info(f"✅ Morning analysis done: {result.get('trend',{}).get('bias','?')} bias | {result.get('day_type','?')}")
@@ -1181,20 +1143,30 @@ ANALYZE and return ONLY this JSON:
 # SECTION 8: TELEGRAM
 # ═══════════════════════════════════════════════════════
 
+# ── CHANGE 1: tg_send returns True/False + status check ──
 def tg_send(text):
-    """Send message to Telegram"""
+    """Send message to Telegram and return True/False"""
     if not TG_BOT_TOKEN or not TG_CHAT_ID:
         log.warning("Telegram not configured")
-        return
+        return False
+
     url = f"https://api.telegram.org/bot{TG_BOT_TOKEN}/sendMessage"
     try:
-        requests.post(url, json={
+        resp = requests.post(url, json={
             "chat_id":    TG_CHAT_ID,
             "text":       text,
             "parse_mode": "HTML"
         }, timeout=10)
+
+        if resp.status_code != 200:
+            log.error(f"Telegram send failed {resp.status_code}: {resp.text[:200]}")
+            return False
+
+        return True
+
     except Exception as e:
         log.error(f"Telegram error: {e}")
+        return False
 
 
 def send_morning_brief(ctx, calc):
@@ -1263,7 +1235,6 @@ def send_signal(ai_resp, current_price):
         setup_parts.append(p5)
     setup_str = " + ".join(setup_parts) if setup_parts else "Price Action"
 
-    # Confirmations list for Telegram
     conf_str = ""
     if confs:
         conf_str = "\n" + "\n".join([f"  ✔ {c}" for c in confs[:5]])
@@ -1352,10 +1323,13 @@ Signals : {total}
 # SECTION 9: ORCHESTRATOR
 # ═══════════════════════════════════════════════════════
 
+# ── Duplicate run prevention ─────────────────────────
+FIRST_ANALYSIS_LOCK = threading.Lock()
+
+
 def is_market_open():
-    """FIX 7: Weekend + market hours check"""
+    """Weekend + market hours check"""
     now = datetime.now(IST)
-    # Saturday=5, Sunday=6 → market closed
     if now.weekday() >= 5:
         log.info("Weekend — market closed")
         return False
@@ -1363,17 +1337,20 @@ def is_market_open():
     return dtime(9, 15) <= now.time() <= dtime(15, 30)
 
 
-def morning_job():
-    """Runs at 9:20:10 IST — Full morning analysis"""
-    log.info("=" * 55)
-    log.info("🌅 MORNING JOB STARTED")
-    log.info("=" * 55)
+# ── CHANGE 5: morning_job renamed to first_analysis_job ──
+def first_analysis_job():
+    """Runs at 9:20:10 IST — Full first analysis"""
+
+    if not FIRST_ANALYSIS_LOCK.acquire(blocking=False):
+        log.info("⏭️ First analysis already running — skip duplicate")
+        return
 
     try:
-        # Fetch all TF data
-        tf_data = fetch_all_tf_morning()
+        log.info("=" * 55)
+        log.info("🌅 FIRST ANALYSIS JOB STARTED")
+        log.info("=" * 55)
 
-        # Run AI analysis
+        tf_data = fetch_all_tf_morning()
         ctx = run_morning_analysis(tf_data)
 
         if ctx:
@@ -1382,11 +1359,14 @@ def morning_job():
             )
             send_morning_brief(ctx, calc)
         else:
-            tg_send("⚠️ Morning analysis failed — check logs")
+            tg_send("⚠️ First analysis failed — check logs")
 
     except Exception as e:
-        log.error(f"Morning job error: {e}")
-        tg_send(f"⚠️ Morning job error: {str(e)[:100]}")
+        log.error(f"First analysis job error: {e}")
+        tg_send(f"⚠️ First analysis job error: {str(e)[:100]}")
+
+    finally:
+        FIRST_ANALYSIS_LOCK.release()
 
 
 def intraday_job():
@@ -1395,13 +1375,19 @@ def intraday_job():
         return
 
     try:
-        # Get morning context
+        # ── CHANGE 7: auto-run first_analysis_job if context missing ──
         morning_ctx = get_morning_context()
-        if not morning_ctx:
-            log.warning("No morning context — skipping")
-            return
 
-        # Get current price
+        if not morning_ctx:
+            log.warning("No first analysis context — running first_analysis_job now")
+            first_analysis_job()
+            morning_ctx = get_morning_context()
+
+            if not morning_ctx:
+                log.warning("First analysis still missing — skipping intraday")
+                tg_send("⚠️ First analysis failed, intraday analysis skipped")
+                return
+
         current_price = get_ltp()
         if not current_price:
             log.warning("LTP fetch failed — skipping")
@@ -1409,20 +1395,17 @@ def intraday_job():
 
         log.info(f"📍 LTP: {current_price}")
 
-        # Track active signal (FREE)
         update = track_active_signal(current_price)
         if update:
             event  = update["event"]
             signal = update["signal"]
             log.info(f"📡 Signal update: {event}")
             send_signal_update(event, signal)
-            return  # Signal handled, skip new analysis
+            return
 
-        # Detect price state (FREE)
         state = detect_price_state(current_price, morning_ctx)
         log.info(f"📊 State: {state[0]} | Level: {state[1]}")
 
-        # Should we call AI?
         should_call, reason = should_call_ai(state, morning_ctx)
         if not should_call:
             log.info(f"⏭️  Skip AI: {reason}")
@@ -1430,12 +1413,8 @@ def intraday_job():
 
         log.info(f"🤖 Calling AI — {reason}")
 
-        # Fetch intraday data
         tf_data = fetch_all_tf_intraday()
 
-        # Run AI analysis
-        # Note: candle_close_ok() internally uses get_last_completed_m5_candle()
-        # so incomplete candle is handled automatically inside filter
         ai_resp = run_intraday_analysis(
             tf_data, morning_ctx, current_price, state
         )
@@ -1446,10 +1425,8 @@ def intraday_job():
         signal_type = ai_resp.get("signal", "AVOID")
         confidence  = ai_resp.get("confidence", "LOW")
 
-        # Quality filter — only HIGH confidence signals
         if signal_type in ["STRONG_BUY", "STRONG_SELL"]:
 
-            # ── SIDEWAYS Structure Reject (Python FREE) ──
             structure     = ai_resp.get("structure", {})
             structure_val = str(structure.get("current", "")).upper()
             if structure_val == "SIDEWAYS":
@@ -1457,12 +1434,10 @@ def intraday_job():
                 tg_send("⚠️ Signal rejected: SIDEWAYS structure — wait for clear direction")
                 return
 
-            # Validate SL/Target structure
             if not validate_signal(ai_resp, current_price):
                 tg_send(f"⚠️ AI signal rejected: invalid SL/Target\n{ai_resp.get('reason','')}")
                 return
 
-            # Confirmation count check (min 3 real factors)
             if not confirmation_ok(ai_resp):
                 tg_send(
                     f"⚠️ AI signal rejected: less than 3 confirmations\n"
@@ -1470,7 +1445,6 @@ def intraday_job():
                 )
                 return
 
-            # Risk-Reward check (min 1:1.5)
             if not rr_ok(ai_resp):
                 tg_send(
                     f"⚠️ AI signal rejected: poor RR ratio\n"
@@ -1478,8 +1452,6 @@ def intraday_job():
                 )
                 return
 
-            # ── Candle Close Direction (Python FREE) ─────
-            # Uses last COMPLETED 5m candle automatically
             if not candle_close_ok(tf_data, signal_type):
                 direction = "bullish" if signal_type == "STRONG_BUY" else "bearish"
                 log.info(f"⏭️  Signal rejected: candle close not {direction}")
@@ -1514,7 +1486,48 @@ def closing_job():
 
 
 # ═══════════════════════════════════════════════════════
-# SECTION 10: SCHEDULER + MAIN
+# SECTION 10: STARTUP STATUS
+# ═══════════════════════════════════════════════════════
+
+BOT_STARTED_AT = datetime.now(IST)
+
+
+# ── CHANGE 4: startup self-check function ────────────
+def send_startup_status():
+    """Send startup status to Telegram"""
+    upstox_ok = False
+    ltp_text  = "not tested"
+
+    try:
+        ltp = get_ltp()
+        if ltp:
+            upstox_ok = True
+            ltp_text  = str(ltp)
+        else:
+            ltp_text = "failed"
+    except Exception as e:
+        ltp_text = f"error: {str(e)[:60]}"
+
+    ai_key_ok = bool(ANTHROPIC_KEY)
+    tg_ok     = bool(TG_BOT_TOKEN and TG_CHAT_ID)
+
+    msg = f"""🚀 <b>Nifty50 AI Bot Started</b>
+
+<b>SELF CHECK:</b>
+Telegram : {'✅ OK' if tg_ok else '❌ Missing'}
+Upstox   : {'✅ OK' if upstox_ok else '❌ Failed'} | LTP: {ltp_text}
+Claude   : {'✅ API key found' if ai_key_ok else '❌ Missing'}
+Redis    : {redis_status()}
+
+Scheduler: ✅ Starting
+Mode     : Data + AI Analysis only
+AutoTrade: ❌ OFF"""
+
+    tg_send(msg)
+
+
+# ═══════════════════════════════════════════════════════
+# SECTION 11: SCHEDULER + MAIN
 # ═══════════════════════════════════════════════════════
 
 def main():
@@ -1522,7 +1535,7 @@ def main():
     log.info("║   NIFTY50 AI BOT — Starting Up...        ║")
     log.info("╚══════════════════════════════════════════╝")
 
-    # Validate env vars
+    # ── Validate env vars ────────────────────────────
     if not UPSTOX_TOKEN:
         log.error("❌ UPSTOX_ANALYTICS_TOKEN missing!")
         return
@@ -1532,21 +1545,26 @@ def main():
     if not TG_BOT_TOKEN:
         log.error("❌ TELEGRAM_BOT_TOKEN missing!")
         return
+    # ── CHANGE 2: TG_CHAT_ID validation ──────────────
+    if not TG_CHAT_ID:
+        log.error("❌ TELEGRAM_CHAT_ID missing!")
+        return
 
-    tg_send("🚀 <b>Nifty50 AI Bot Started!</b>\nWaiting for 9:20 AM...")
+    # ── CHANGE 9: startup status replace ─────────────
+    send_startup_status()
 
-    # ── BackgroundScheduler (non-blocking) ───────────
+    # ── BackgroundScheduler ───────────────────────────
     scheduler = BackgroundScheduler(timezone=IST)
 
-    # Morning analysis — 9:20:10 IST
+    # ── CHANGE 6: first_analysis_job in scheduler ────
     scheduler.add_job(
-        morning_job,
+        first_analysis_job,
         "cron",
         hour=9, minute=20, second=10,
-        id="morning_job"
+        id="first_analysis_job"
     )
 
-    # Intraday loop — every 5min at :10 seconds (9:25 onwards)
+    # Intraday loop — every 5min at :10 seconds
     scheduler.add_job(
         intraday_job,
         "cron",
@@ -1582,11 +1600,30 @@ def main():
 
     scheduler.start()
     log.info("✅ Scheduler started (background)")
-    log.info("   Morning  : 9:20:10 IST")
-    log.info("   Intraday : Every 5min (9:25 → 15:10)")
-    log.info("   Closing  : 15:30:30 IST")
+    log.info("   First Analysis : 9:20:10 IST")
+    log.info("   Intraday       : Every 5min (9:25 → 15:10)")
+    log.info("   Closing        : 15:30:30 IST")
 
-    # ── Flask Web Server (Koyeb health check) ────────
+    # ── CHANGE 8: startup first analysis auto-schedule ──
+    now        = datetime.now(IST)
+    start_time = datetime.strptime("09:20", "%H:%M").time()
+    end_time   = datetime.strptime("15:10", "%H:%M").time()
+
+    if (
+        now.weekday() < 5
+        and start_time <= now.time() <= end_time
+        and not get_morning_context()
+    ):
+        scheduler.add_job(
+            first_analysis_job,
+            "date",
+            run_date=datetime.now(IST) + timedelta(seconds=10),
+            id="startup_first_analysis",
+            replace_existing=True
+        )
+        log.info("⚡ Startup first analysis scheduled (market hours, context missing)")
+
+    # ── Flask Web Server (Koyeb health check) ─────────
     flask_app = Flask(__name__)
 
     @flask_app.route("/")
@@ -1610,7 +1647,9 @@ def main():
 
     port = int(os.getenv("PORT", 8000))
     log.info(f"🌐 Flask server on port {port}")
-    flask_app.run(host="0.0.0.0", port=port)
+
+    # ── CHANGE 10: use_reloader=False ─────────────────
+    flask_app.run(host="0.0.0.0", port=port, use_reloader=False)
 
 
 if __name__ == "__main__":
