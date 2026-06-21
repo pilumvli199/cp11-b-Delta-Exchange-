@@ -56,7 +56,7 @@ UPSTOX_HDRS   = {
 ZONE_NEAR_PTS       = int(os.getenv("ZONE_NEAR_POINTS",    "25"))
 WAIT_COOLDOWN_MIN   = int(os.getenv("WAIT_COOLDOWN_MIN",   "25"))
 SIGNAL_COOLDOWN_MIN = int(os.getenv("SIGNAL_COOLDOWN_MIN", "30"))
-MAX_ZONES           = int(os.getenv("MAX_ZONES",           "12"))
+MAX_ZONES           = int(os.getenv("MAX_ZONES",            "7"))
 MAX_AI_RAW_LOG      = int(os.getenv("MAX_AI_RAW_LOG",     "100"))
 MIN_CONFIRMATIONS   = int(os.getenv("MIN_CONFIRMATIONS",    "2"))
 
@@ -842,7 +842,7 @@ RULES:
 - Use 5M/15M for actionable zone boundaries
 - Daily/1H for bias and context only
 - Zones = price RANGES (low to high), not single lines
-- Max 8–10 useful zones
+- Max 5–7 useful zones total. Quality over quantity — only the most relevant zones.
 - If unclear structure → create WAIT/NO_TRADE zone
 - Do NOT force bullish or bearish bias
 
@@ -850,6 +850,26 @@ SWEEP/RECLAIM RULE:
 If recent candles show price swept below a support then reclaimed it →
 mark that area as FLIP or LIQUIDITY zone with preferred_action BUY_CE.
 Mirror for bearish: swept above resistance then rejected → BUY_PE zone.
+
+LIQUIDITY FIGHT MODULE (apply this thinking when identifying zones):
+- Liquidity is relative to current price. When price is near an area, even
+  minor local levels matter. When price has moved far away from an area,
+  only the major base (origin of a clean, strong move) matters — find the
+  ORIGIN point of the cleanest/strongest move as the major liquidity base.
+- A "clean move" = consecutive same-direction candles with small wicks and
+  minimal overlap/pullback. The starting point of such a move is a strong
+  liquidity base — mark it as a zone with tag "MAJOR_LIQUIDITY" and
+  note in "why" that it's a clean-move origin.
+- Identify the single biggest-range candle (dominance candle) visible in
+  the data. Calculate its mid-point (50% of its high-low range). This
+  mid-point is the level where the losing side (buyer or seller) typically
+  gives up. If you find such a candle relevant to current price action,
+  create a zone around that mid-point with tag "DOMINANCE_50" and explain
+  which side (BUYER/SELLER) dominance it represents and at what price the
+  opposite side would "fail" (i.e. lose) if breached.
+- For every zone you create, add a "tags" array. Use tags from:
+  ["MAJOR_LIQUIDITY", "LOCAL_LIQUIDITY", "DOMINANCE_50", "CLEAN_ORIGIN",
+  "FLIP", "SWEEP_TARGET"] — as many as apply, or empty array if none apply.
 
 RESPOND ONLY in valid JSON. No text outside JSON."""
 
@@ -884,6 +904,40 @@ Bullish: price swept below support → reclaimed above → minor lower-high brok
 → BUY_CE if last completed 5M close confirms reclaim.
 Bearish: price swept above resistance → rejected back below → minor higher-low broken
 → BUY_PE if last completed 5M close confirms rejection.
+
+LIQUIDITY FIGHT MODULE (always consider this when market shows sudden
+fall followed by sudden rise, or vice versa — do not blindly follow one
+side; treat it as a buyer-vs-seller fight):
+- Identify the biggest-range candle visible in the recent 15M/5M data
+  near the touched zone (the "dominance candle"). Calculate its 50%
+  mid-point.
+- If price has reclaimed/closed back past 50% of a big SELLER (bearish)
+  dominance candle → seller is weakening → lean bullish (BUY_CE bias),
+  especially if combined with the touched zone being support/liquidity.
+- If price has lost/closed back past 50% of a big BUYER (bullish)
+  dominance candle → buyer is weakening → lean bearish (BUY_PE bias).
+- "Reaction" = price touches a level and makes a small bounce/fall (limited
+  move). "Action" = price breaks the level cleanly and continues toward the
+  next liquidity target (bigger move). Both can be traded — distinguish
+  which one is more likely from candle behavior (wick size, close strength,
+  follow-through).
+- A weak/indecisive close right at a liquidity level is often an invitation
+  for the opposite side to take over — treat this as a WAIT or early warning,
+  not a confirmed signal, unless the next candle confirms.
+- If the liquidity fight state is unclear (no dominance candle, no clean
+  reclaim/loss), fall back to standard zone rules above and return WAIT
+  if not confident.
+
+REFERENCE LEVELS (for the "reference" field — analytics only, not advice):
+- ref_sl should be placed just beyond the relevant structural invalidation
+  point: for BUY_CE, just below the dominance candle's failure level / the
+  touched zone's low. For BUY_PE, just above the dominance candle's failure
+  level / the touched zone's high.
+- ref_target should be the next realistic liquidity zone in the trade's
+  direction (use the "OTHER ACTIVE ZONES" list to pick the nearest relevant
+  one), not an arbitrary point distance.
+- Briefly justify ref_sl/ref_target in terms of structure in your "reason"
+  or "risk_note" if relevant.
 
 RESPOND ONLY in valid JSON. No text outside JSON."""
 
@@ -933,7 +987,27 @@ def run_first_analysis(tf_data, mode="FIRST"):
         log.error("Data build failed")
         return None
 
-    user_prompt = data_str + """
+    # Mode-aware liquidity focus
+    if mode == "FIRST":
+        liquidity_focus = (
+            "\n[FOCUS FOR THIS RUN: MAJOR LIQUIDITY]\n"
+            "This is the first analysis of the day. Use the Daily/1H data "
+            "to identify MAJOR liquidity bases — the origin points of the "
+            "cleanest, strongest historical moves. These are zones that "
+            "matter even when price is far away from them. Tag them "
+            "MAJOR_LIQUIDITY."
+        )
+    else:
+        liquidity_focus = (
+            "\n[FOCUS FOR THIS RUN: LOCAL LIQUIDITY]\n"
+            "This is an hourly reanalysis. In addition to validating "
+            "major zones, use the recent 15M/5M candles to identify LOCAL "
+            "liquidity — recent reaction areas, equal highs/lows, and "
+            "dominance candles near current price. Tag them LOCAL_LIQUIDITY "
+            "or DOMINANCE_50 as relevant."
+        )
+
+    user_prompt = data_str + liquidity_focus + """
 
 RETURN ONLY this JSON:
 {
@@ -948,6 +1022,7 @@ RETURN ONLY this JSON:
       "low": 0,
       "high": 0,
       "strength": "STRONG/MED/WEAK",
+      "tags": [],
       "preferred_action": "BUY_CE/BUY_PE/WAIT",
       "why": "short reason"
     }
@@ -1071,15 +1146,18 @@ def run_eod_summary():
     buy_ce = [s for s in history if s.get("signal") == "BUY_CE"]
     buy_pe = [s for s in history if s.get("signal") == "BUY_PE"]
     waits  = [s for s in history if s.get("signal") == "WAIT"]
+    rejected = [s for s in history if s.get("signal") == "REJECTED"]
 
     ref_hit = sum(1 for s in history if s.get("result") == "REF_TARGET_HIT")
     ref_sl  = sum(1 for s in history if s.get("result") == "REF_SL_HIT")
     expired = sum(1 for s in history if s.get("result") == "EXPIRED")
     still_open = sum(1 for s in history if s.get("result") == "OPEN")
 
-    # Signal detail lines
+    # Signal detail lines — only actual trades shown in detail (WAIT/REJECTED summarized as count)
     detail = ""
     for s in history:
+        if s.get("signal") not in ["BUY_CE", "BUY_PE"]:
+            continue
         r  = s.get("result","?")
         em = ("✅" if r=="REF_TARGET_HIT" else
               "❌" if r=="REF_SL_HIT" else
@@ -1089,12 +1167,13 @@ def run_eod_summary():
 
     msg = f"""📈 <b>DAY SUMMARY | {today}</b>
 
-Signals  : {len(history)}
+Signals scanned : {len(history)}
 🟢 BUY CE: {len(buy_ce)}
 🔴 BUY PE: {len(buy_pe)}
-⚪ WAIT  : {len(waits)}
+⚪ WAIT (silent)    : {len(waits)}
+🚫 Rejected (silent): {len(rejected)}
 
-<b>Ref Analytics:</b>
+<b>Ref Analytics (trades only):</b>
 ✅ Ref Target: {ref_hit}
 ❌ Ref SL    : {ref_sl}
 ⏰ Expired   : {expired}
@@ -1381,10 +1460,9 @@ def zone_monitor_job():
             ]
             save_zones(updated_zones)
             zones = updated_zones
-            tg_send(
-                f"🔄 Zone flipped: {zone_id}\n"
-                f"{touched['type']} → {updated_zone['type']}\n"
-                f"LTP: {ltp}"
+            log.info(
+                f"🔄 Zone flipped: {zone_id} "
+                f"{touched['type']} → {updated_zone['type']} @ LTP:{ltp}"
             )
 
         # Cooldown check
@@ -1402,10 +1480,17 @@ def zone_monitor_job():
 
         # Validate
         if not validate_decision(result, ltp):
-            tg_send(
-                f"⚠️ Signal rejected: low conf / weak confirmations\n"
-                f"Zone:{zone_id} | Event:{event} | LTP:{ltp}"
-            )
+            log.info(f"⏭️ Signal rejected (low conf / weak confirmations): {zone_id} | {event}")
+            save_signal_log({
+                "time":       now.strftime("%H:%M"),
+                "zone_id":    zone_id,
+                "event":      event,
+                "signal":     "REJECTED",
+                "confidence": result.get("confidence"),
+                "ref_sl":     0,
+                "ref_target": 0,
+                "result":     "REJECTED"
+            })
             mark_zone_cooldown(zone_id, "WAIT")
             return
 
@@ -1414,7 +1499,7 @@ def zone_monitor_job():
         # Set cooldown
         mark_zone_cooldown(zone_id, sig)
 
-        # Save to history
+        # Save to history (always — for analytics/EOD summary)
         ref = result.get("reference", {})
         save_signal_log({
             "time":       now.strftime("%H:%M"),
@@ -1427,8 +1512,11 @@ def zone_monitor_job():
             "result":     "OPEN" if sig != "WAIT" else "WAIT_SENT"
         })
 
-        # Send Telegram
-        send_signal(result, ltp, updated_zone)
+        # Telegram alert ONLY for actual trade signals — WAIT stays silent
+        if sig in ["BUY_CE", "BUY_PE"]:
+            send_signal(result, ltp, updated_zone)
+        else:
+            log.info(f"⏭️ WAIT — logged silently, no Telegram alert")
 
     except Exception as e:
         log.error(f"Zone monitor error: {e}")
