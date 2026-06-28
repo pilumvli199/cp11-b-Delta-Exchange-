@@ -1,8 +1,32 @@
 """
 ╔══════════════════════════════════════════════════════╗
-║       NIFTY50 ZONE ASSISTANT BOT — V2               ║
+║       NIFTY50 ZONE ASSISTANT BOT — V3               ║
 ║       Smart Assistant | Manual Trade Confirm         ║
 ║       Output: BUY CE / BUY PE / WAIT                ║
+║                                                        ║
+║  V3 FIXES (on top of V2):                            ║
+║  FIX 4  : tg_send() silent-failure + HTML escaping   ║
+║  FIX 5  : closing_job() order (EOD summary before    ║
+║           OPEN→EOD_OPEN rename, else "Open:0" bug)   ║
+║  FIX 6  : OI snapshot decoupled from zone-touch gate ║
+║           (saved every 5min tick → history not N/A)  ║
+║  FIX 7  : Nearest expiry fetched from Upstox API,    ║
+║           cached 6hr (holiday-shift safe), with      ║
+║           hardcoded-Tuesday fallback                 ║
+║  FIX 8  : Model split — Sonnet for first analysis,   ║
+║           Haiku for zone decision. max_tokens split  ║
+║           (2500 / 1000) — was truncating zones JSON  ║
+║  FIX 9  : Dynamic zone-touch buffer (15% of zone     ║
+║           width, min 10) replaces flat ZONE_NEAR_PTS ║
+║  FIX 10 : Wick threshold 0.25→0.30 for support/      ║
+║           resistance rejection (kept body>=-3 —      ║
+║           strict body>=0 would reject real hammers)  ║
+║  FIX 11 : Liquidity-fight module now conditional —   ║
+║           Python detects dominance candle + 50%      ║
+║           reclaim, only injects module when found    ║
+║  FIX 12 : get_context_zones() — adds factual S/R     ║
+║           range + position% to prompt, no AI-biasing ║
+║           "lean" language                            ║
 ╚══════════════════════════════════════════════════════╝
 """
 
@@ -14,6 +38,7 @@ import os
 import json
 import math
 import time
+import html
 import logging
 import requests
 import pandas as pd
@@ -46,6 +71,7 @@ REDIS_URL     = os.getenv("REDIS_URL", "redis://localhost:6379")
 # ── Upstox ───────────────────────────────────────────
 NIFTY_KEY     = "NSE_INDEX|Nifty 50"
 NIFTY_KEY_ENC = quote("NSE_INDEX|Nifty 50")
+UPSTOX_V2     = "https://api.upstox.com/v2"
 UPSTOX_V3     = "https://api.upstox.com/v3"
 UPSTOX_HDRS   = {
     "Authorization": f"Bearer {UPSTOX_TOKEN}",
@@ -53,7 +79,8 @@ UPSTOX_HDRS   = {
 }
 
 # ── Bot Settings ──────────────────────────────────────
-ZONE_NEAR_PTS       = int(os.getenv("ZONE_NEAR_POINTS",    "25"))
+# NOTE (FIX 9): flat ZONE_NEAR_PTS removed — replaced by zone_buffer()
+# dynamic buffer (15% of zone width, min 10pts). See SECTION 4.
 WAIT_COOLDOWN_MIN   = int(os.getenv("WAIT_COOLDOWN_MIN",   "25"))
 SIGNAL_COOLDOWN_MIN = int(os.getenv("SIGNAL_COOLDOWN_MIN", "30"))
 MAX_ZONES           = int(os.getenv("MAX_ZONES",            "7"))
@@ -66,9 +93,27 @@ SIDEWAYS_CANDLE_CNT  = int(os.getenv("SIDEWAYS_CANDLE_CNT",  "4"))
 SIDEWAYS_MAX_RANGE   = int(os.getenv("SIDEWAYS_MAX_RANGE",  "30"))
 BREAKOUT_BUFFER      = int(os.getenv("BREAKOUT_BUFFER",     "10"))
 LAST_AI_CALL_MINUTE  = int(os.getenv("LAST_AI_CALL_MINUTE",  "5"))
+# FIX 10: wick threshold raised 0.25 → 0.30 (used in detect_candle_event)
+REJECTION_WICK_RATIO = float(os.getenv("REJECTION_WICK_RATIO", "0.30"))
+# Minimum range (pts) for a candle to count as a "dominance candle"
+DOMINANCE_MIN_RANGE  = int(os.getenv("DOMINANCE_MIN_RANGE", "15"))
+DOMINANCE_LOOKBACK   = int(os.getenv("DOMINANCE_LOOKBACK",  "15"))
 
-# ── AI Model ─────────────────────────────────────────
-HAIKU_MODEL = "claude-haiku-4-5-20251001"
+# ── AI Models (FIX 8: split by task) ──────────────────
+ANALYSIS_MODEL            = os.getenv("ANALYSIS_MODEL", "claude-sonnet-4-6")
+DECISION_MODEL            = os.getenv("DECISION_MODEL", "claude-haiku-4-5-20251001")
+FIRST_ANALYSIS_MAX_TOKENS = int(os.getenv("FIRST_ANALYSIS_MAX_TOKENS", "2500"))
+ZONE_DECISION_MAX_TOKENS  = int(os.getenv("ZONE_DECISION_MAX_TOKENS",  "1000"))
+
+
+# ── Small helper (FIX 4) ──────────────────────────────
+def esc(text):
+    """HTML-escape any AI-generated free text before sending to Telegram
+    with parse_mode=HTML. Prevents silent send failures when AI text
+    contains '<', '>' or '&' (e.g. 'price < zone')."""
+    if text is None:
+        return text
+    return html.escape(str(text), quote=False)
 
 
 # ═══════════════════════════════════════════════════════
@@ -112,7 +157,6 @@ def fetch_historical(unit, interval, candles_needed):
     elif unit == "hours":
         from_date = (now - timedelta(days=15)).strftime("%Y-%m-%d")
     else:  # minutes
-        # Fetch last 3 days → covers yesterday + today
         from_date = (now - timedelta(days=3)).strftime("%Y-%m-%d")
 
     url  = (f"{UPSTOX_V3}/historical-candle/"
@@ -159,11 +203,8 @@ def fetch_all_data():
 
     daily  = fetch_historical("days",    1, 15)
     hourly = fetch_historical("hours",   1, 30)
-
-    # 15M → historical last 3 days = yesterday + today context
     m15_hist = fetch_historical("minutes", 15, 60)
 
-    # 5M → intraday (today) + historical fallback
     m5 = fetch_intraday("minutes", 5)
     if m5.empty or len(m5) < 10:
         log.warning("Intraday 5M empty → using historical")
@@ -181,14 +222,242 @@ def fetch_zone_decision_data():
     """Light fetch for zone decision — 15M + 5M only"""
     m15 = fetch_intraday("minutes", 15)
     m5  = fetch_intraday("minutes", 5)
-
-    # Fallback to historical if intraday empty
     if m15.empty:
         m15 = fetch_historical("minutes", 15, 30)
     if m5.empty:
         m5  = fetch_historical("minutes", 5,  40)
-
     return {"m15": m15, "m5": m5}
+
+
+# ═══════════════════════════════════════════════════════
+# SECTION 2.5: OI + PCR TRACKING
+# ═══════════════════════════════════════════════════════
+
+def get_weekly_expiry_fallback():
+    """
+    FIX 7: This is now only a FALLBACK if the live expiry API fails.
+    Hardcoded 'next Tuesday' logic breaks on holiday shifts
+    (NSE moves expiry to Wed/other day around holidays, budget day etc).
+    """
+    now = datetime.now(IST)
+    days_to_tue = (1 - now.weekday()) % 7
+    if days_to_tue == 0 and now.hour >= 15:
+        days_to_tue = 7
+    return (now + timedelta(days=days_to_tue)).strftime("%Y-%m-%d")
+
+
+def get_nearest_expiry():
+    """
+    FIX 7: Fetch real expiry dates from Upstox option/contract endpoint.
+    Cached 6hr (Redis/RAM) so we don't hit this every 5min tick.
+    Falls back to hardcoded-Tuesday calc if API fails — this is the
+    real reason OI was silently dead since day 1 (wrong expiry → empty
+    chain → fetch_oi_chain() returns None → OI module never added to
+    the AI prompt, not even once).
+    """
+    cached = _get("nearest_expiry_cache")
+    if cached and cached.get("fetched_at"):
+        try:
+            fetched_at = datetime.fromisoformat(cached["fetched_at"])
+            if fetched_at.tzinfo is None:
+                fetched_at = IST.localize(fetched_at)
+            if datetime.now(IST) - fetched_at < timedelta(hours=6):
+                return cached["expiry"]
+        except Exception:
+            pass
+
+    try:
+        url  = f"{UPSTOX_V2}/option/contract?instrument_key={NIFTY_KEY_ENC}"
+        data = upstox_get(url)
+
+        expiries = set()
+        if isinstance(data, list):
+            for item in data:
+                exp = item.get("expiry")
+                if exp:
+                    expiries.add(exp)
+        elif isinstance(data, dict):
+            # some Upstox responses nest under a list-valued key
+            for v in data.values():
+                if isinstance(v, list):
+                    for item in v:
+                        exp = item.get("expiry") if isinstance(item, dict) else None
+                        if exp:
+                            expiries.add(exp)
+
+        if not expiries:
+            log.warning("Expiry API returned no expiries — using fallback calc")
+            return get_weekly_expiry_fallback()
+
+        nearest = sorted(expiries)[0]
+        _set("nearest_expiry_cache", {
+            "expiry":     nearest,
+            "fetched_at": datetime.now(IST).isoformat()
+        }, ttl=6 * 3600 + 300)
+        log.info(f"✅ Nearest expiry fetched: {nearest}")
+        return nearest
+
+    except Exception as e:
+        log.error(f"get_nearest_expiry error: {e} — using fallback calc")
+        return get_weekly_expiry_fallback()
+
+
+def fetch_oi_chain(ltp):
+    """
+    Fetch ATM ± 3 strikes OI + volume from Upstox.
+    Nifty strike gap = 50 pts → 7 strikes total.
+    Returns compact dict or None.
+    """
+    try:
+        atm    = round(ltp / 50) * 50
+        expiry = get_nearest_expiry()           # FIX 7
+        url    = (f"{UPSTOX_V2}/option/chain"
+                  f"?instrument_key={NIFTY_KEY_ENC}"
+                  f"&expiry_date={expiry}")
+
+        resp = upstox_get(url)
+        if not resp:
+            log.warning("OI chain fetch failed")
+            return None
+
+        target = {atm + (i * 50) for i in range(-3, 4)}
+        strikes = {}
+
+        for opt in resp:
+            sp = int(opt.get("strike_price", 0))
+            if sp not in target:
+                continue
+            ce = opt.get("call_options", {}).get("market_data", {})
+            pe = opt.get("put_options",  {}).get("market_data", {})
+            strikes[sp] = {
+                "ce_oi":  int(ce.get("oi",     0)),
+                "pe_oi":  int(pe.get("oi",     0)),
+                "ce_vol": int(ce.get("volume", 0)),
+                "pe_vol": int(pe.get("volume", 0)),
+            }
+
+        if not strikes:
+            log.warning(f"OI: no strikes found for ATM {atm}")
+            return None
+
+        tot_ce_oi  = sum(v["ce_oi"]  for v in strikes.values())
+        tot_pe_oi  = sum(v["pe_oi"]  for v in strikes.values())
+        tot_ce_vol = sum(v["ce_vol"] for v in strikes.values())
+        tot_pe_vol = sum(v["pe_vol"] for v in strikes.values())
+        pcr        = round(tot_pe_oi / tot_ce_oi, 3) if tot_ce_oi > 0 else 1.0
+        ce_wall    = max(strikes, key=lambda s: strikes[s]["ce_oi"])
+        pe_wall    = max(strikes, key=lambda s: strikes[s]["pe_oi"])
+
+        return {
+            "atm":         atm,
+            "expiry":      expiry,
+            "strikes":     strikes,
+            "tot_ce_oi":   tot_ce_oi,
+            "tot_pe_oi":   tot_pe_oi,
+            "tot_ce_vol":  tot_ce_vol,
+            "tot_pe_vol":  tot_pe_vol,
+            "pcr":         pcr,
+            "ce_wall":     ce_wall,
+            "pe_wall":     pe_wall,
+        }
+    except Exception as e:
+        log.error(f"fetch_oi_chain error: {e}")
+        return None
+
+
+def save_oi_snapshot(data):
+    """Save OI snapshot keyed by current 5-min slot"""
+    now  = datetime.now(IST)
+    slot = now.strftime("%H:%M")
+    _set(f"oi:{slot}", data, ttl=7200)
+    log.info(f"OI snapshot saved: {slot} | PCR:{data.get('pcr')}")
+
+
+def get_oi_snapshot(minutes_ago):
+    """Retrieve OI snapshot from N minutes ago (rounded to 5min)"""
+    past = datetime.now(IST) - timedelta(minutes=minutes_ago)
+    rounded = (past.minute // 5) * 5
+    slot = past.replace(minute=rounded, second=0).strftime("%H:%M")
+    return _get(f"oi:{slot}")
+
+
+def _fmt_chg(past_data, key):
+    if past_data is None:
+        return "N/A"
+    val = past_data.get(key)
+    return f"{val:+.1f}%" if val is not None else "N/A"
+
+
+def _vol_label(current_vol, baseline_vol):
+    if baseline_vol <= 0:
+        return "?"
+    r = current_vol / baseline_vol
+    if r >= 2.0: return f"HIGH({r:.1f}x)"
+    if r >= 1.0: return f"MED({r:.1f}x)"
+    return f"LOW({r:.1f}x)"
+
+
+def format_oi_context(current):
+    """
+    FIX 6: Pure formatter — takes an ALREADY-FETCHED `current` OI dict
+    and turns it into the compact AI-prompt string. Does NOT fetch or
+    save anything itself anymore (that's now done once per tick in
+    zone_monitor_job, decoupled from zone-touch gating — see SECTION 8).
+    """
+    if not current:
+        return None
+
+    baseline     = _get("oi_baseline") or {}
+    base_ce_vol  = baseline.get("tot_ce_vol", 0)
+    base_pe_vol  = baseline.get("tot_pe_vol", 0)
+
+    chg = {}
+    for mins in [5, 15, 30]:
+        past = get_oi_snapshot(mins)
+        if past and past.get("tot_ce_oi", 0) > 0:
+            chg[mins] = {
+                "ce_chg": round(
+                    (current["tot_ce_oi"] - past["tot_ce_oi"])
+                    / past["tot_ce_oi"] * 100, 1),
+                "pe_chg": round(
+                    (current["tot_pe_oi"] - past["tot_pe_oi"])
+                    / past["tot_pe_oi"] * 100, 1),
+                "pcr": past.get("pcr"),
+            }
+        else:
+            chg[mins] = None
+
+    pcr_str = (
+        f"{chg[30]['pcr'] if chg[30] else 'N/A'}→"
+        f"{chg[15]['pcr'] if chg[15] else 'N/A'}→"
+        f"{chg[5]['pcr']  if chg[5]  else 'N/A'}→"
+        f"{current['pcr']}"
+    )
+
+    ce_chg_str = (
+        f"{_fmt_chg(chg[30],'ce_chg')}/"
+        f"{_fmt_chg(chg[15],'ce_chg')}/"
+        f"{_fmt_chg(chg[5], 'ce_chg')} (30/15/5min)"
+    )
+    pe_chg_str = (
+        f"{_fmt_chg(chg[30],'pe_chg')}/"
+        f"{_fmt_chg(chg[15],'pe_chg')}/"
+        f"{_fmt_chg(chg[5], 'pe_chg')} (30/15/5min)"
+    )
+
+    cw_oi = current["strikes"].get(current["ce_wall"], {}).get("ce_oi", 0)
+    pw_oi = current["strikes"].get(current["pe_wall"], {}).get("pe_oi", 0)
+
+    return (
+        f"[OI | ATM:{current['atm']} | {current.get('expiry', get_nearest_expiry())}]\n"
+        f"PCR:{pcr_str}\n"
+        f"CE_OI_CHG:{ce_chg_str}\n"
+        f"PE_OI_CHG:{pe_chg_str}\n"
+        f"CE_WALL:{current['ce_wall']}({cw_oi//100000:.1f}L) "
+        f"PE_WALL:{current['pe_wall']}({pw_oi//100000:.1f}L)\n"
+        f"CE_VOL:{_vol_label(current['tot_ce_vol'], base_ce_vol)} "
+        f"PE_VOL:{_vol_label(current['tot_pe_vol'], base_pe_vol)}"
+    )
 
 
 # ═══════════════════════════════════════════════════════
@@ -258,15 +527,14 @@ def build_first_analysis_string(tf_data):
     if daily.empty:
         return None
 
-    d_base  = get_base(daily)
-    h_base  = get_base(hourly)
-    m15_base= get_base(m15)
-    m5_base = get_base(m5)
+    d_base   = get_base(daily)
+    h_base   = get_base(hourly)
+    m15_base = get_base(m15)
+    m5_base  = get_base(m5)
 
-    # Pre-calc: PDH/PDL
     pdc_row = None
     try:
-        today = datetime.now(IST).date()
+        today   = datetime.now(IST).date()
         last_ts = pd.to_datetime(daily.iloc[-1]["ts"]).date()
         pdc_row = daily.iloc[-2] if last_ts == today else daily.iloc[-1]
     except Exception:
@@ -302,7 +570,46 @@ LTP_approx:{ltp_approx}
 {compress_ohlc(m5, m5_base, 60)}"""
 
 
-def build_zone_decision_string(tf_data, ltp, touched_zone, all_zones, morning_ctx):
+def _price_context_block(context_zones):
+    """
+    FIX 12: Factual S/R range + position% block.
+    Deliberately NO 'lean'/'bias' language here — that was Python
+    pre-judging the trade and could contaminate the AI's independent
+    confirmation-based reasoning. Just the raw facts.
+    """
+    if not context_zones:
+        return ""
+    sup = context_zones.get("support")
+    res = context_zones.get("resistance")
+    if not sup and not res:
+        return ""
+
+    sup_str = f"{sup['id']}({sup['low']}-{sup['high']})" if sup else "None"
+    res_str = f"{res['id']}({res['low']}-{res['high']})" if res else "None"
+
+    extra = ""
+    width = context_zones.get("range_width")
+    pos   = context_zones.get("position_pct")
+    if width is not None and pos is not None:
+        extra = f"\nRange width:{width}pts | Position:{pos}% (0%=at support, 100%=at resistance)"
+
+    return f"\n\n[PRICE CONTEXT]\nNearest Support:{sup_str} | Nearest Resistance:{res_str}{extra}"
+
+
+def _dominance_block(dominance):
+    """FIX 11: factual dominance-candle numbers, no interpretation here."""
+    if not dominance:
+        return ""
+    return (
+        f"\n\n[DOMINANCE CANDLE]\n"
+        f"Range:{dominance['low']}-{dominance['high']} ({dominance['rng']}pts) | "
+        f"Side:{dominance['side']} | 50%:{dominance['mid']} | "
+        f"Reclaimed:{'YES' if dominance['reclaimed'] else 'NO'}"
+    )
+
+
+def build_zone_decision_string(tf_data, ltp, touched_zone, all_zones, morning_ctx,
+                                oi_context=None, context_zones=None, dominance=None):
     """Build compact string for zone touch decision"""
     m15 = drop_incomplete_candle(tf_data.get("m15", pd.DataFrame()), 15)
     m5  = drop_incomplete_candle(tf_data.get("m5",  pd.DataFrame()), 5)
@@ -311,7 +618,6 @@ def build_zone_decision_string(tf_data, ltp, touched_zone, all_zones, morning_ct
     m15_str = compress_ohlc(m15, base, 20)
     m5_str  = compress_ohlc(m5,  base, 30)
 
-    # Other zones context (except touched)
     other = [
         f"  {z['id']}:{z['type']} {z['low']}-{z['high']} [{z['strength']}]"
         for z in all_zones if z.get("id") != touched_zone.get("id")
@@ -321,6 +627,10 @@ def build_zone_decision_string(tf_data, ltp, touched_zone, all_zones, morning_ct
     now_str = datetime.now(IST).strftime("%H:%M")
     bias    = morning_ctx.get("bias", "?")
     struct  = morning_ctx.get("structure", "?")
+
+    oi_block         = f"\n\n{oi_context}" if oi_context else ""
+    price_ctx_block  = _price_context_block(context_zones)
+    dominance_block  = _dominance_block(dominance)
 
     return f"""=== ZONE DECISION | {now_str} ===
 
@@ -340,7 +650,7 @@ Why:{touched_zone.get('why','')}
 {other_str}
 
 [CURRENT LTP]
-{ltp}
+{ltp}{oi_block}{price_ctx_block}{dominance_block}
 
 [15M - last 20 candles | BASE:{base}]
 (O H L C | oldest→newest)
@@ -393,7 +703,6 @@ def _delete(key):
         _memory.pop(key, None)
 
 
-# Zone CRUD
 def save_zones(zones):
     _set("zones", zones[:MAX_ZONES])
     log.info(f"✅ {len(zones)} zones saved")
@@ -417,7 +726,6 @@ def flush_day():
     log.info("🧹 Day data flushed")
 
 
-# Signal history
 def get_signal_history():
     return _get("signal_history") or []
 
@@ -428,100 +736,177 @@ def save_signal_log(entry):
     _set("signal_history", h)
 
 
-# AI raw log (debug)
 def save_ai_raw_log(entry):
     logs = _get("ai_raw_log") or []
     logs.append(entry)
     _set("ai_raw_log", logs[-MAX_AI_RAW_LOG:])
 
 
-# Zone touch check
+def zone_buffer(zone):
+    """
+    FIX 9: Dynamic touch buffer — replaces flat ZONE_NEAR_PTS=25.
+    15% of zone width, floor 10pts. For this bot's typical 20-30pt
+    zones this mostly floors to 10 (tighter than the old flat 25) —
+    wider zones (60pt+) get a genuinely larger, proportional buffer.
+    """
+    width = zone.get("high", 0) - zone.get("low", 0)
+    return max(10, width * 0.15)
+
+
 def get_touched_zone(ltp, zones):
     """
     Return touched zone. Priority:
     1. Non-NO_TRADE/SIDEWAYS zones first
     2. NO_TRADE/SIDEWAYS only if nothing else touched
-    This prevents NO_TRADE from blocking overlapping actionable zones.
     """
     no_trade_types = ["NO_TRADE", "SIDEWAYS"]
 
-    # Pass 1: actionable zones first
     for z in zones:
         if z.get("type") in no_trade_types:
             continue
-        low  = z.get("low",  0)
-        high = z.get("high", 0)
-        if (ltp >= low - ZONE_NEAR_PTS) and (ltp <= high + ZONE_NEAR_PTS):
+        low, high = z.get("low", 0), z.get("high", 0)
+        buf = zone_buffer(z)
+        if (ltp >= low - buf) and (ltp <= high + buf):
             return z
 
-    # Pass 2: NO_TRADE only if no actionable zone found
     for z in zones:
         if z.get("type") not in no_trade_types:
             continue
-        low  = z.get("low",  0)
-        high = z.get("high", 0)
-        if (ltp >= low - ZONE_NEAR_PTS) and (ltp <= high + ZONE_NEAR_PTS):
+        low, high = z.get("low", 0), z.get("high", 0)
+        buf = zone_buffer(z)
+        if (ltp >= low - buf) and (ltp <= high + buf):
             return z
 
     return None
 
 
-# Cooldown
+def get_context_zones(ltp, zones):
+    """
+    FIX 12: Nearest support/resistance around current LTP, plus range
+    width and position% within that range. Pure facts — no bias label.
+    """
+    no_trade_types = ["NO_TRADE", "SIDEWAYS"]
+    candidates = [z for z in zones if z.get("type") not in no_trade_types]
+
+    above = [z for z in candidates if z.get("low", 0) > ltp]
+    below = [z for z in candidates if z.get("high", 0) < ltp]
+
+    nearest_resistance = min(above, key=lambda z: z["low"] - ltp) if above else None
+    nearest_support    = max(below, key=lambda z: ltp - z["high"]) if below else None
+
+    range_width  = None
+    position_pct = None
+    if nearest_resistance and nearest_support:
+        range_low  = nearest_support["high"]
+        range_high = nearest_resistance["low"]
+        range_width = range_high - range_low
+        if range_width > 0:
+            position_pct = round((ltp - range_low) / range_width * 100, 1)
+
+    return {
+        "support":      nearest_support,
+        "resistance":   nearest_resistance,
+        "range_width":  range_width,
+        "position_pct": position_pct
+    }
+
+
+def detect_dominance_candle(df, ltp, lookback=DOMINANCE_LOOKBACK):
+    """
+    FIX 11: Python-side dominance-candle detection (replaces asking the
+    AI to eyeball OHLC arrays for this every call). Finds the
+    biggest-range candle in the last `lookback` 5M candles, determines
+    which side (BUYER/SELLER) dominated it, and whether current price
+    has reclaimed (SELLER candle) or lost (BUYER candle) its 50% level.
+    Returns None if no candle clears DOMINANCE_MIN_RANGE — most ticks
+    won't have one, and the AI prompt module is only injected when this
+    returns something (token savings + the module wasn't relevant most
+    of the time anyway).
+    """
+    if df.empty or len(df) < 3:
+        return None
+
+    d = df.tail(lookback).copy()
+    if d.empty:
+        return None
+
+    d["rng"] = d["h"] - d["l"]
+    idx = d["rng"].idxmax()
+    row = d.loc[idx]
+    rng = int(row["rng"])
+    if rng < DOMINANCE_MIN_RANGE:
+        return None
+
+    o, c, h, l = int(row["o"]), int(row["c"]), int(row["h"]), int(row["l"])
+    mid = round((h + l) / 2)
+    side = "SELLER" if c < o else "BUYER"
+
+    # SELLER dominance candle: reclaimed if price closed back above 50%
+    # BUYER dominance candle: "reclaimed" here means buyer is losing —
+    # price closed back below 50%
+    reclaimed = (ltp > mid) if side == "SELLER" else (ltp < mid)
+
+    return {
+        "low": l, "high": h, "mid": mid,
+        "side": side, "rng": rng, "reclaimed": reclaimed
+    }
+
+
 def zone_cooldown_ok(zone_id):
+    """
+    Only block if same zone was just called in last 5 minutes.
+    Prevents duplicate calls on same candle only.
+    """
     key = f"cooldown_{zone_id}"
     cd  = _get(key)
     if cd:
         try:
             until = datetime.fromisoformat(cd["until"])
-            # Ensure timezone aware for comparison
             if until.tzinfo is None:
                 until = IST.localize(until)
             now = datetime.now(IST)
             if now < until:
-                rem = int((until - now).total_seconds() / 60)
-                log.info(f"Zone {zone_id} cooldown: {rem}min left")
+                rem = int((until - now).total_seconds())
+                log.info(f"Zone {zone_id} cooldown: {rem}s left")
                 return False
         except Exception as e:
-            log.warning(f"Cooldown parse error for {zone_id}: {e}")
+            log.warning(f"Cooldown parse error {zone_id}: {e}")
     return True
 
 
 def mark_zone_cooldown(zone_id, signal_type):
-    mins = (
-        SIGNAL_COOLDOWN_MIN if signal_type in ["BUY_CE", "BUY_PE"]
-        else WAIT_COOLDOWN_MIN
-    )
+    """
+    BUY_CE/BUY_PE: 30min cooldown (trade active)
+    WAIT: 5min only (next candle can re-check)
+    """
+    if signal_type in ["BUY_CE", "BUY_PE"]:
+        mins = 30
+    else:
+        mins = 5
+
     until = (datetime.now(IST) + timedelta(minutes=mins)).isoformat()
     _set(f"cooldown_{zone_id}", {"until": until}, ttl=mins*60+60)
-    log.info(f"Zone {zone_id} cooldown set: {mins}min")
+    log.info(f"Zone {zone_id} cooldown: {mins}min ({signal_type})")
 
 
-# Zone merge — hourly reanalysis
 def merge_zones(existing, new_zones, ltp):
     """
     Merge new zones into existing.
-    Rules:
-    - FLIP_ zones are preserved (don't overwrite with AI's original type)
-    - 50% overlap with non-flip zone → replace
-    - No overlap → add
-    - Too far from LTP (>500 pts) → drop
-    - Max MAX_ZONES zones
+    FLIP_ zones preserved, 50% overlap → replace, too far → drop.
     """
     def overlap(a, b):
         ol = max(0, min(a["high"], b["high"]) - max(a["low"], b["low"]))
         span_a = max(a["high"] - a["low"], 1)
         return ol / span_a
 
-    # Separate flipped zones — preserve them always
-    flipped   = [z for z in existing if z.get("type","").startswith("FLIP_")]
-    non_flip  = [z for z in existing if not z.get("type","").startswith("FLIP_")]
+    flipped  = [z for z in existing if z.get("type","").startswith("FLIP_")]
+    non_flip = [z for z in existing if not z.get("type","").startswith("FLIP_")]
 
     result = list(non_flip)
     for nz in new_zones:
         if abs((nz["low"] + nz["high"]) / 2 - ltp) > 500:
-            continue  # too far
+            continue
 
-        # Don't overwrite a flipped zone with AI's old type
         skip = False
         for fz in flipped:
             if overlap(fz, nz) >= 0.5:
@@ -539,15 +924,11 @@ def merge_zones(existing, new_zones, ltp):
         if not replaced:
             result.append(nz)
 
-    # Add back flipped zones
     result.extend(flipped)
-
-    # Sort by distance from LTP, keep max
     result.sort(key=lambda z: abs((z["low"] + z["high"]) / 2 - ltp))
     return result[:MAX_ZONES]
 
 
-# Track open signals ref analytics
 def track_open_signals(ltp):
     """Check if ref_sl or ref_target hit for open signals"""
     history = get_signal_history()
@@ -580,10 +961,6 @@ def track_open_signals(ltp):
 
 
 # ═══════════════════════════════════════════════════════
-# SECTION 5: AI CALLS (Haiku)
-# ═══════════════════════════════════════════════════════
-
-# ═══════════════════════════════════════════════════════
 # SECTION 4.5: CANDLE TRIGGER ENGINE
 # ═══════════════════════════════════════════════════════
 
@@ -599,7 +976,6 @@ def get_last_completed_m5_candle(tf_data, buffer_seconds=10):
     """
     Return last COMPLETED 5min candle.
     If latest candle still forming → use previous one.
-    9:25 candle completes at 9:30:10 (5min + 10sec buffer)
     """
     m5 = tf_data.get("m5", pd.DataFrame())
     if m5.empty:
@@ -624,7 +1000,8 @@ def get_last_completed_m5_candle(tf_data, buffer_seconds=10):
 
     return None
 
-def detect_candle_event(tf_data, zone):
+
+def detect_candle_event(tf_data, zone, ltp=0):
     """
     Detect what type of candle event is happening at this zone.
     Returns: (event_name, event_detail)
@@ -660,7 +1037,6 @@ def detect_candle_event(tf_data, zone):
         zone_high = zone.get("high", 0)
         zone_type = zone.get("type", "")
 
-        # Normalize FLIP type → price position decide karto
         if zone_type == "FLIP":
             zone_type = "FLIP_SUPPORT" if ltp >= zone_low else "FLIP_RESISTANCE"
 
@@ -669,7 +1045,7 @@ def detect_candle_event(tf_data, zone):
         upper_wick  = h - max(o, c)
         lower_wick  = min(o, c) - l
 
-        # ── 1. BREAKOUT: Close above resistance + buffer ──
+        # ── 1. BREAKOUT ───────────────────────────────────
         if c > zone_high + BREAKOUT_BUFFER:
             if zone_type in ["RESISTANCE", "FLIP_RESISTANCE", "LIQUIDITY"]:
                 return (
@@ -677,7 +1053,7 @@ def detect_candle_event(tf_data, zone):
                     f"close {c} > zone_high {zone_high}+{BREAKOUT_BUFFER}"
                 )
 
-        # ── 2. BREAKDOWN: Close below support + buffer ────
+        # ── 2. BREAKDOWN ──────────────────────────────────
         if c < zone_low - BREAKOUT_BUFFER:
             if zone_type in ["SUPPORT", "FLIP_SUPPORT", "LIQUIDITY"]:
                 return (
@@ -686,7 +1062,6 @@ def detect_candle_event(tf_data, zone):
                 )
 
         # ── 3. BULLISH SWEEP RECLAIM ──────────────────────
-        # Wick below zone, close back above zone_low
         if l < zone_low - 5 and c > zone_low:
             return (
                 "BULLISH_SWEEP_RECLAIM",
@@ -694,7 +1069,6 @@ def detect_candle_event(tf_data, zone):
             )
 
         # ── 4. BEARISH SWEEP REJECT ───────────────────────
-        # Wick above zone, close back below zone_high
         if h > zone_high + 5 and c < zone_high:
             return (
                 "BEARISH_SWEEP_REJECT",
@@ -720,12 +1094,16 @@ def detect_candle_event(tf_data, zone):
                     )
 
         # ── 6. SUPPORT REJECTION ──────────────────────────
+        # FIX 10: wick ratio raised 0.25 → 0.30 (REJECTION_WICK_RATIO).
+        # body>=-3 kept as-is on purpose — a hammer (small red body,
+        # long lower wick) is a real bullish reversal signal; forcing
+        # body>=0 would reject genuine hammers, not just noise.
         if zone_type in ["SUPPORT", "FLIP_SUPPORT", "LIQUIDITY"]:
-            bullish_body  = body > 0
-            doji_body     = abs(body) <= 3           # doji at support is OK
-            good_wick     = lower_wick > candle_rng * 0.25 if candle_rng > 0 else False
-            close_holds   = c > zone_low + 5
-            not_bearish   = body >= -3               # reject clearly bearish bodies
+            bullish_body = body > 0
+            doji_body    = abs(body) <= 3
+            good_wick    = lower_wick > candle_rng * REJECTION_WICK_RATIO if candle_rng > 0 else False
+            close_holds  = c > zone_low + 5
+            not_bearish  = body >= -3
 
             if close_holds and not_bearish and (bullish_body or (doji_body and good_wick)):
                 return (
@@ -736,10 +1114,10 @@ def detect_candle_event(tf_data, zone):
         # ── 7. RESISTANCE REJECTION ───────────────────────
         if zone_type in ["RESISTANCE", "FLIP_RESISTANCE"]:
             bearish_body = body < 0
-            doji_body    = abs(body) <= 3            # doji at resistance is OK
-            good_wick    = upper_wick > candle_rng * 0.25 if candle_rng > 0 else False
+            doji_body    = abs(body) <= 3
+            good_wick    = upper_wick > candle_rng * REJECTION_WICK_RATIO if candle_rng > 0 else False
             close_below  = c < zone_high - 5
-            not_bullish  = body <= 3                 # reject clearly bullish bodies
+            not_bullish  = body <= 3
 
             if close_below and not_bullish and (bearish_body or (doji_body and good_wick)):
                 return (
@@ -788,7 +1166,10 @@ def maybe_flip_zone(zone, event):
     return z
 
 
-# ── Prompt Modules — one per situation ───────────────
+# ═══════════════════════════════════════════════════════
+# SECTION 5: AI CALLS
+# ═══════════════════════════════════════════════════════
+
 PROMPT_MODULES = {
     "SUPPORT_REJECTION": (
         "SITUATION: SUPPORT_REJECTION — Price at support, bullish candle visible. "
@@ -847,6 +1228,56 @@ PROMPT_MODULES = {
     ),
 }
 
+
+OI_INTERPRETATION_MODULE = """
+OI CONTEXT MODULE (use when [OI CONTEXT] block is present):
+
+DATA MEANING:
+- PCR trend: 30min→15min→5min→now (rising PCR = more PE writing = bearish bias)
+- CE_OI_CHG: CE open interest change % (positive = fresh short writing = bearish)
+- PE_OI_CHG: PE open interest change % (positive = fresh put writing = bearish hedge)
+- CE_WALL: Strike with highest CE OI (resistance — sellers protecting this level)
+- PE_WALL: Strike with highest PE OI (support — sellers protecting this level)
+- CE_VOL/PE_VOL: Volume vs morning baseline (HIGH = active directional buying)
+
+SIGNAL RULES:
+- CE_OI rising + PE_OI falling + PCR falling = Bullish bias → lean BUY_CE
+- PE_OI rising + CE_OI falling + PCR rising = Bearish bias → lean BUY_PE
+- CE_VOL HIGH = Call buyers active = directional bullish bet
+- PE_VOL HIGH = Put buyers active = directional bearish bet OR hedge
+- CE_WALL breaking (OI suddenly drops) = Resistance gone → price can move up
+- PE_WALL breaking (OI suddenly drops) = Support gone → price can move down
+- OI and price action BOTH confirm same direction = HIGH confidence
+- OI and price action CONFLICT = reduce confidence → lean toward WAIT
+- If OI shows N/A (no history yet) = ignore OI, use only price action
+"""
+
+# FIX 11: This module is now INJECTED CONDITIONALLY (only when Python's
+# detect_dominance_candle() actually finds a qualifying candle), and it
+# no longer asks the AI to "identify the biggest-range candle" itself —
+# Python already did that and put exact numbers in [DOMINANCE CANDLE].
+# The AI's job here is interpretation only.
+LIQUIDITY_FIGHT_MODULE = """
+LIQUIDITY FIGHT MODULE (a dominance candle was detected — see the
+[DOMINANCE CANDLE] block in the data: Range/Side/50%/Reclaimed):
+
+- The dominance candle is the biggest-range candle in recent price
+  action — strong BUYER or SELLER control at the time it formed.
+- Side:SELLER + Reclaimed:YES → price closed back above that candle's
+  50% level → seller weakening → lean bullish, especially if the
+  touched zone is support/liquidity.
+- Side:BUYER + Reclaimed:YES → price closed back below that candle's
+  50% level → buyer weakening → lean bearish.
+- Reclaimed:NO → the dominant side is still in control → no extra edge
+  from this candle; fall back to standard zone rules.
+- "Reaction" = small bounce/fall at a level. "Action" = clean break with
+  follow-through toward the next liquidity target (use [OTHER ACTIVE
+  ZONES] / [PRICE CONTEXT] to judge the next target). Judge from wick
+  size, close strength, and follow-through which is more likely.
+- A weak/indecisive close right at the level is often an invitation for
+  the opposite side to take over — treat this as WAIT/early warning,
+  not a confirmed signal, unless the next candle confirms.
+"""
 
 FIRST_ANALYSIS_SYSTEM = """You are an expert NIFTY50 price-action zone analyst.
 The user manually confirms every trade. This is NOT auto-trading.
@@ -910,6 +1341,8 @@ You receive:
 - Touched zone details
 - All active zones
 - Current LTP
+- Price context (nearest support/resistance, range position) when available
+- A detected dominance candle (if any) when available
 - Last completed 15M and 5M candles (delta-encoded)
 
 TASK: Decide ONE output for price touching/entering a saved zone:
@@ -933,29 +1366,6 @@ Bullish: price swept below support → reclaimed above → minor lower-high brok
 Bearish: price swept above resistance → rejected back below → minor higher-low broken
 → BUY_PE if last completed 5M close confirms rejection.
 
-LIQUIDITY FIGHT MODULE (always consider this when market shows sudden
-fall followed by sudden rise, or vice versa — do not blindly follow one
-side; treat it as a buyer-vs-seller fight):
-- Identify the biggest-range candle visible in the recent 15M/5M data
-  near the touched zone (the "dominance candle"). Calculate its 50%
-  mid-point.
-- If price has reclaimed/closed back past 50% of a big SELLER (bearish)
-  dominance candle → seller is weakening → lean bullish (BUY_CE bias),
-  especially if combined with the touched zone being support/liquidity.
-- If price has lost/closed back past 50% of a big BUYER (bullish)
-  dominance candle → buyer is weakening → lean bearish (BUY_PE bias).
-- "Reaction" = price touches a level and makes a small bounce/fall (limited
-  move). "Action" = price breaks the level cleanly and continues toward the
-  next liquidity target (bigger move). Both can be traded — distinguish
-  which one is more likely from candle behavior (wick size, close strength,
-  follow-through).
-- A weak/indecisive close right at a liquidity level is often an invitation
-  for the opposite side to take over — treat this as a WAIT or early warning,
-  not a confirmed signal, unless the next candle confirms.
-- If the liquidity fight state is unclear (no dominance candle, no clean
-  reclaim/loss), fall back to standard zone rules above and return WAIT
-  if not confident.
-
 REFERENCE LEVELS (for the "reference" field — analytics only, not advice):
 - ref_sl should be placed just beyond the relevant structural invalidation
   point: for BUY_CE, just below the dominance candle's failure level / the
@@ -970,7 +1380,12 @@ REFERENCE LEVELS (for the "reference" field — analytics only, not advice):
 RESPOND ONLY in valid JSON. No text outside JSON."""
 
 
-def call_haiku(system_prompt, user_prompt):
+def call_claude(system_prompt, user_prompt, model=DECISION_MODEL, max_tokens=ZONE_DECISION_MAX_TOKENS):
+    """
+    FIX 8: renamed from call_haiku — now parameterized by model + max_tokens
+    so both Sonnet (first analysis) and Haiku (zone decision) share one
+    code path. Defaults stay Haiku/1000 for any caller that doesn't override.
+    """
     url  = "https://api.anthropic.com/v1/messages"
     hdrs = {
         "x-api-key":         ANTHROPIC_KEY,
@@ -978,8 +1393,8 @@ def call_haiku(system_prompt, user_prompt):
         "content-type":      "application/json"
     }
     body = {
-        "model":      HAIKU_MODEL,
-        "max_tokens": 1500,
+        "model":      model,
+        "max_tokens": max_tokens,
         "system":     system_prompt,
         "messages":   [{"role": "user", "content": user_prompt}]
     }
@@ -987,9 +1402,9 @@ def call_haiku(system_prompt, user_prompt):
         r = requests.post(url, headers=hdrs, json=body, timeout=45)
         if r.status_code == 200:
             return r.json()["content"][0]["text"]
-        log.error(f"Haiku error {r.status_code}: {r.text[:200]}")
+        log.error(f"Claude API error {r.status_code} ({model}): {r.text[:200]}")
     except Exception as e:
-        log.error(f"Haiku call failed: {e}")
+        log.error(f"Claude call failed ({model}): {e}")
     return None
 
 
@@ -1007,7 +1422,7 @@ def parse_json(raw):
 
 
 def run_first_analysis(tf_data, mode="FIRST"):
-    """Run first analysis or hourly reanalysis"""
+    """Run first analysis or hourly reanalysis — uses ANALYSIS_MODEL (Sonnet)"""
     log.info(f"🌅 Running {mode} analysis...")
 
     data_str = build_first_analysis_string(tf_data)
@@ -1015,7 +1430,6 @@ def run_first_analysis(tf_data, mode="FIRST"):
         log.error("Data build failed")
         return None
 
-    # Mode-aware liquidity focus
     if mode == "FIRST":
         liquidity_focus = (
             "\n[FOCUS FOR THIS RUN: MAJOR LIQUIDITY]\n"
@@ -1062,12 +1476,16 @@ RETURN ONLY this JSON:
   }
 }"""
 
-    raw    = call_haiku(FIRST_ANALYSIS_SYSTEM, user_prompt)
+    raw    = call_claude(
+        FIRST_ANALYSIS_SYSTEM, user_prompt,
+        model=ANALYSIS_MODEL, max_tokens=FIRST_ANALYSIS_MAX_TOKENS
+    )
     result = parse_json(raw)
 
     save_ai_raw_log({
         "time":   datetime.now(IST).strftime("%H:%M"),
         "mode":   mode,
+        "model":  ANALYSIS_MODEL,
         "raw":    raw[:500] if raw else None,
         "parsed": bool(result)
     })
@@ -1077,24 +1495,33 @@ RETURN ONLY this JSON:
     return result
 
 
-def run_zone_decision(tf_data, ltp, touched_zone, all_zones, morning_ctx, event="", event_reason=""):
-    """Run zone touch AI decision — uses prompt router based on event"""
+def run_zone_decision(tf_data, ltp, touched_zone, all_zones, morning_ctx,
+                       event="", event_reason="", oi_context=None):
+    """Run zone touch AI decision — uses DECISION_MODEL (Haiku) + event-based prompt routing"""
     log.info(f"🎯 Zone decision: {touched_zone.get('id')} @ LTP:{ltp} | Event:{event}")
 
+    # FIX 11/12: compute Python-side facts once, inject conditionally
+    m5_for_dom    = drop_incomplete_candle(tf_data.get("m5", pd.DataFrame()), 5)
+    dominance     = detect_dominance_candle(m5_for_dom, ltp)
+    context_zones = get_context_zones(ltp, all_zones)
+
     data_str = build_zone_decision_string(
-        tf_data, ltp, touched_zone, all_zones, morning_ctx
+        tf_data, ltp, touched_zone, all_zones, morning_ctx,
+        oi_context=oi_context, context_zones=context_zones, dominance=dominance
     )
 
-    # Add detected event context to user prompt
     event_block = ""
     if event and event != "NO_EVENT":
         event_block = f"\n\n[DETECTED CANDLE EVENT]\nEvent: {event}\nDetail: {event_reason}"
 
-    # Prompt router — base + situation module
     situation_module = PROMPT_MODULES.get(event, "")
     system_prompt    = ZONE_DECISION_SYSTEM
     if situation_module:
         system_prompt += f"\n\n{situation_module}"
+    if dominance:
+        system_prompt += f"\n\n{LIQUIDITY_FIGHT_MODULE}"
+    if oi_context:
+        system_prompt += OI_INTERPRETATION_MODULE
 
     user_prompt = data_str + event_block + """
 
@@ -1118,15 +1545,20 @@ RETURN ONLY this JSON:
   }
 }"""
 
-    raw    = call_haiku(system_prompt, user_prompt)
+    raw    = call_claude(
+        system_prompt, user_prompt,
+        model=DECISION_MODEL, max_tokens=ZONE_DECISION_MAX_TOKENS
+    )
     result = parse_json(raw)
 
     save_ai_raw_log({
         "time":    datetime.now(IST).strftime("%H:%M"),
         "mode":    "ZONE_DECISION",
+        "model":   DECISION_MODEL,
         "event":   event,
         "zone_id": touched_zone.get("id"),
         "ltp":     ltp,
+        "dominance_found": bool(dominance),
         "raw":     raw[:500] if raw else None,
         "parsed":  bool(result)
     })
@@ -1149,13 +1581,12 @@ def validate_decision(result, ltp):
     count = result.get("confirmation_count", len(confs))
 
     if sig == "WAIT":
-        return True  # WAIT always valid
+        return True
 
     if conf == "LOW":
         log.info("Rejected: LOW confidence")
         return False
 
-    # Filter fake confirmations
     fake = {"none","na","n/a","null","","factor1","factor2","reason1","reason2"}
     real = [c for c in confs if str(c).strip().lower() not in fake and len(str(c)) > 5]
 
@@ -1167,21 +1598,25 @@ def validate_decision(result, ltp):
 
 
 def run_eod_summary():
-    """3:30 PM — send day summary to Telegram"""
+    """
+    3:30 PM — send day summary to Telegram.
+    FIX 5: This MUST run (and read signal_history) BEFORE closing_job()
+    renames "OPEN" → "EOD_OPEN", otherwise still_open always reads 0
+    even when trades were genuinely open at close.
+    """
     history = get_signal_history()
     today   = datetime.now(IST).strftime("%d %b %Y")
 
-    buy_ce = [s for s in history if s.get("signal") == "BUY_CE"]
-    buy_pe = [s for s in history if s.get("signal") == "BUY_PE"]
-    waits  = [s for s in history if s.get("signal") == "WAIT"]
+    buy_ce   = [s for s in history if s.get("signal") == "BUY_CE"]
+    buy_pe   = [s for s in history if s.get("signal") == "BUY_PE"]
+    waits    = [s for s in history if s.get("signal") == "WAIT"]
     rejected = [s for s in history if s.get("signal") == "REJECTED"]
 
-    ref_hit = sum(1 for s in history if s.get("result") == "REF_TARGET_HIT")
-    ref_sl  = sum(1 for s in history if s.get("result") == "REF_SL_HIT")
-    expired = sum(1 for s in history if s.get("result") == "EXPIRED")
+    ref_hit    = sum(1 for s in history if s.get("result") == "REF_TARGET_HIT")
+    ref_sl     = sum(1 for s in history if s.get("result") == "REF_SL_HIT")
+    expired    = sum(1 for s in history if s.get("result") == "EXPIRED")
     still_open = sum(1 for s in history if s.get("result") == "OPEN")
 
-    # Signal detail lines — only actual trades shown in detail (WAIT/REJECTED summarized as count)
     detail = ""
     for s in history:
         if s.get("signal") not in ["BUY_CE", "BUY_PE"]:
@@ -1191,7 +1626,7 @@ def run_eod_summary():
               "❌" if r=="REF_SL_HIT" else
               "⏰" if r=="EXPIRED" else
               "⏳" if r=="OPEN" else "⚪")
-        detail += f"\n{em} {s['time']} {s['signal']} @ {s.get('zone_id','?')} → {r}"
+        detail += f"\n{em} {s['time']} {esc(s['signal'])} @ {esc(s.get('zone_id','?'))} → {esc(r)}"
 
     msg = f"""📈 <b>DAY SUMMARY | {today}</b>
 
@@ -1217,35 +1652,43 @@ Signals scanned : {len(history)}
 # ═══════════════════════════════════════════════════════
 
 def tg_send(text):
+    """
+    FIX 4: capture + check response status code (was previously fire-
+    and-forget — non-200 responses, e.g. HTML parse errors from
+    unescaped AI text, went completely undetected). Callers should esc()
+    any AI-generated free text before it reaches here.
+    """
     if not TG_BOT_TOKEN or not TG_CHAT_ID:
         log.warning("Telegram not configured")
         return
     try:
-        requests.post(
+        r = requests.post(
             f"https://api.telegram.org/bot{TG_BOT_TOKEN}/sendMessage",
             json={"chat_id": TG_CHAT_ID, "text": text, "parse_mode": "HTML"},
             timeout=10
         )
+        if r.status_code != 200:
+            log.error(f"Telegram send failed {r.status_code}: {r.text[:300]}")
     except Exception as e:
         log.error(f"Telegram error: {e}")
 
 
 def send_zone_brief(ctx, zones):
     """Morning/hourly zone brief"""
-    today = datetime.now(IST).strftime("%d %b %Y %H:%M")
-    bias  = ctx.get("bias","?")
-    struct= ctx.get("structure","?")
-    dtype = ctx.get("day_type","?")
-    summ  = ctx.get("summary","")
+    today  = datetime.now(IST).strftime("%d %b %Y %H:%M")
+    bias   = esc(ctx.get("bias","?"))
+    struct = esc(ctx.get("structure","?"))
+    dtype  = esc(ctx.get("day_type","?"))
+    summ   = esc(ctx.get("summary",""))
 
     zone_lines = ""
     for z in zones[:8]:
         em = ("🟢" if z.get("preferred_action")=="BUY_CE" else
               "🔴" if z.get("preferred_action")=="BUY_PE" else "⚪")
         zone_lines += (
-            f"\n{em} {z['id']}: {z['low']}–{z['high']} "
-            f"[{z['strength']}] → {z.get('preferred_action','?')}"
-            f"\n   {z.get('why','')}"
+            f"\n{em} {esc(z['id'])}: {z['low']}–{z['high']} "
+            f"[{esc(z['strength'])}] → {esc(z.get('preferred_action','?'))}"
+            f"\n   {esc(z.get('why',''))}"
         )
 
     nt  = ctx.get("no_trade_zone",{})
@@ -1270,23 +1713,22 @@ Manual chart confirm karach trade ghe!"""
 
 def send_signal(result, ltp, touched_zone):
     """Send zone decision to Telegram"""
-    sig   = result.get("signal","WAIT")
-    conf  = result.get("confidence","?")
-    ztype = result.get("zone_type","?")
-    react = result.get("zone_reaction","?")
-    reason= result.get("reason","")
-    risk  = result.get("risk_note","")
-    msg_h = result.get("message","")
-    confs = result.get("confirmations",[])
+    sig    = result.get("signal","WAIT")
+    conf   = esc(result.get("confidence","?"))
+    react  = esc(result.get("zone_reaction","?"))
+    reason = esc(result.get("reason",""))
+    risk   = esc(result.get("risk_note",""))
+    msg_h  = esc(result.get("message",""))
+    confs  = result.get("confirmations",[])
 
-    ref   = result.get("reference",{})
+    ref     = result.get("reference",{})
     ref_sl  = ref.get("ref_sl",0)
     ref_tgt = ref.get("ref_target",0)
 
     emoji = ("🟢" if sig=="BUY_CE" else
              "🔴" if sig=="BUY_PE" else "⚪")
 
-    conf_lines = "\n".join([f"  ✔ {c}" for c in confs[:5] if c])
+    conf_lines = "\n".join([f"  ✔ {esc(c)}" for c in confs[:5] if c])
     conf_str   = f"\n{conf_lines}" if conf_lines else ""
 
     ref_str = ""
@@ -1295,10 +1737,10 @@ def send_signal(result, ltp, touched_zone):
 
     now_str = datetime.now(IST).strftime("%H:%M")
 
-    msg = f"""{emoji} <b>{sig} | {now_str}</b>
+    msg = f"""{emoji} <b>{esc(sig)} | {now_str}</b>
 
 LTP       : {ltp}
-Zone      : {touched_zone.get('id')} ({touched_zone.get('low')}–{touched_zone.get('high')})
+Zone      : {esc(touched_zone.get('id'))} ({touched_zone.get('low')}–{touched_zone.get('high')})
 Reaction  : {react}
 Confidence: {conf}
 
@@ -1328,11 +1770,7 @@ def is_market_open():
 
 
 def morning_job():
-    """
-    9:20 IST — First Analysis.
-    If bot starts at 12 PM, same function runs immediately.
-    Uses yesterday + today candles automatically.
-    """
+    """9:20 IST — First Analysis"""
     log.info("=" * 50)
     log.info("🌅 FIRST ANALYSIS JOB")
     log.info("=" * 50)
@@ -1347,11 +1785,22 @@ def morning_job():
         zones = result.get("zones", [])
         save_morning_context(result)
         save_zones(zones)
+
+        ltp_now = get_ltp()
+        if ltp_now:
+            baseline = fetch_oi_chain(ltp_now)
+            if baseline:
+                _set("oi_baseline", baseline, ttl=86400)
+                save_oi_snapshot(baseline)
+                log.info(f"✅ OI baseline saved | PCR:{baseline.get('pcr')} ATM:{baseline.get('atm')} Expiry:{baseline.get('expiry')}")
+            else:
+                log.warning("OI baseline fetch failed — OI context will show N/A today")
+
         send_zone_brief(result, zones)
 
     except Exception as e:
         log.error(f"Morning job error: {e}")
-        tg_send(f"⚠️ Morning job error: {str(e)[:100]}")
+        tg_send(f"⚠️ Morning job error: {esc(str(e)[:100])}")
 
 
 def hourly_job():
@@ -1369,12 +1818,10 @@ def hourly_job():
         if not result:
             return
 
-        # Merge zones
         existing  = get_zones()
         new_zones = result.get("zones", [])
         merged    = merge_zones(existing, new_zones, ltp)
 
-        # Update context
         ctx = get_morning_context() or {}
         ctx.update({
             "bias":      result.get("bias", ctx.get("bias")),
@@ -1389,7 +1836,7 @@ def hourly_job():
         now_str = datetime.now(IST).strftime("%H:%M")
         tg_send(
             f"🔄 <b>Zone Update | {now_str}</b>\n"
-            f"Bias:{result.get('bias')} | Structure:{result.get('structure')} | {len(merged)} zones active"
+            f"Bias:{esc(result.get('bias'))} | Structure:{esc(result.get('structure'))} | {len(merged)} zones active"
         )
         log.info(f"✅ Hourly zone update sent | {len(merged)} zones")
 
@@ -1400,19 +1847,11 @@ def hourly_job():
 def zone_monitor_job():
     """
     Every 5:10 IST — Zone monitor with candle trigger engine.
-
-    Flow:
-    1. Early exit checks (free)
-    2. LTP fetch + ref analytics
-    3. Zone touch check (free)
-    4. Skip NO_TRADE / SIDEWAYS zones
-    5. Fetch intraday data (5M+15M)
-    6. Detect candle event (free)
-    7. Skip if NO_EVENT — saves tokens!
-    8. Maybe flip zone (RESISTANCE → FLIP_SUPPORT etc.)
-    9. Cooldown check
-    10. AI call with prompt router
-    11. Validate + send
+    FIX 6 applied: OI chain fetched + snapshot saved ONCE per tick right
+    after LTP, unconditionally (no longer gated behind "zone touched AND
+    not NO_TRADE"). The fetched `current_oi` is then reused (not
+    re-fetched) later if/when we actually need the formatted OI context
+    for an AI call.
     """
     if not is_market_open():
         return
@@ -1421,7 +1860,6 @@ def zone_monitor_job():
     hour   = now.hour
     minute = now.minute
 
-    # Early exits
     if hour == 9 and minute < 25:
         return
     if hour == 15 and minute > LAST_AI_CALL_MINUTE:
@@ -1429,13 +1867,22 @@ def zone_monitor_job():
         return
 
     try:
-        # LTP + ref tracking
         ltp = get_ltp()
         if not ltp:
             return
         track_open_signals(ltp)
 
-        # Morning context check
+        # FIX 6: unconditional OI snapshot — every tick, regardless of
+        # whether a zone is touched. This is what makes the 5/15/30min
+        # OI history lookback actually have data to find.
+        current_oi = None
+        try:
+            current_oi = fetch_oi_chain(ltp)
+            if current_oi:
+                save_oi_snapshot(current_oi)
+        except Exception as oi_err:
+            log.warning(f"OI fetch failed: {oi_err} — continuing without OI")
+
         morning_ctx = get_morning_context()
         if not morning_ctx:
             log.warning("No morning context — running first analysis")
@@ -1446,7 +1893,6 @@ def zone_monitor_job():
 
         log.info(f"📍 LTP: {ltp}")
 
-        # Zone touch check (FREE)
         zones = get_zones()
         if not zones:
             log.info("No zones saved")
@@ -1461,27 +1907,21 @@ def zone_monitor_job():
         zone_type = touched.get("type", "")
         log.info(f"🎯 Zone: {zone_id} ({touched.get('low')}-{touched.get('high')}) [{zone_type}]")
 
-        # Skip NO_TRADE and SIDEWAYS zones — no AI needed
         if zone_type in ["NO_TRADE", "SIDEWAYS"]:
             log.info(f"⏭️ Skipping {zone_type} zone — no AI call")
             return
 
-        # Fetch intraday data (needed for event detection + AI)
         tf_data = fetch_zone_decision_data()
 
-        # ── Candle Trigger Engine ─────────────────────────
-        event, event_reason = detect_candle_event(tf_data, touched)
+        event, event_reason = detect_candle_event(tf_data, touched, ltp)
         log.info(f"📊 Candle event: {event} | {event_reason}")
 
-        # No clear candle event → skip AI, save tokens
         if event == "NO_EVENT":
             log.info("⏭️ No candle event — skipping AI call")
             return
 
-        # ── Zone flip (RESISTANCE → FLIP_SUPPORT etc.) ───
         updated_zone = maybe_flip_zone(touched, event)
         if updated_zone["type"] != touched["type"]:
-            # Save flipped zone back to Redis
             updated_zones = [
                 updated_zone if z.get("id") == zone_id else z
                 for z in zones
@@ -1493,20 +1933,23 @@ def zone_monitor_job():
                 f"{touched['type']} → {updated_zone['type']} @ LTP:{ltp}"
             )
 
-        # Cooldown check
         if not zone_cooldown_ok(zone_id):
             return
 
-        # ── AI Call with Prompt Router ────────────────────
+        oi_context = format_oi_context(current_oi) if current_oi else None
+        if oi_context:
+            log.info("✅ OI context ready")
+        else:
+            log.info("OI context unavailable — proceeding without OI")
+
         result = run_zone_decision(
             tf_data, ltp, updated_zone, zones,
-            morning_ctx, event, event_reason
+            morning_ctx, event, event_reason, oi_context
         )
 
         if not result:
             return
 
-        # Validate
         if not validate_decision(result, ltp):
             log.info(f"⏭️ Signal rejected (low conf / weak confirmations): {zone_id} | {event}")
             save_signal_log({
@@ -1523,11 +1966,8 @@ def zone_monitor_job():
             return
 
         sig = result.get("signal", "WAIT")
-
-        # Set cooldown
         mark_zone_cooldown(zone_id, sig)
 
-        # Save to history (always — for analytics/EOD summary)
         ref = result.get("reference", {})
         save_signal_log({
             "time":       now.strftime("%H:%M"),
@@ -1540,21 +1980,27 @@ def zone_monitor_job():
             "result":     "OPEN" if sig != "WAIT" else "WAIT_SENT"
         })
 
-        # Telegram alert ONLY for actual trade signals — WAIT stays silent
         if sig in ["BUY_CE", "BUY_PE"]:
             send_signal(result, ltp, updated_zone)
         else:
-            log.info(f"⏭️ WAIT — logged silently, no Telegram alert")
+            log.info("⏭️ WAIT — logged silently, no Telegram alert")
 
     except Exception as e:
         log.error(f"Zone monitor error: {e}")
 
 
 def closing_job():
-    """3:30 PM — Mark open signals expired, EOD summary, flush"""
+    """
+    3:30 PM — EOD summary, then mark open signals expired, then flush.
+    FIX 5: run_eod_summary() now runs BEFORE the OPEN→EOD_OPEN rename.
+    Previously the rename happened first, so run_eod_summary()'s
+    still_open count (which looks for result=="OPEN") always read 0,
+    even on days with genuinely open trades at market close.
+    """
     log.info("🔔 CLOSING JOB")
 
-    # Mark all OPEN signals as EXPIRED before summary
+    run_eod_summary()
+
     history = get_signal_history()
     changed = False
     for s in history:
@@ -1564,7 +2010,6 @@ def closing_job():
     if changed:
         _set("signal_history", history)
 
-    run_eod_summary()
     flush_day()
 
 
@@ -1591,10 +2036,10 @@ def main():
     tg_send(
         f"🚀 <b>Zone Assistant Bot Started!</b>\n"
         f"Time: {now.strftime('%H:%M IST')}\n"
+        f"Analysis model: {esc(ANALYSIS_MODEL)} | Decision model: {esc(DECISION_MODEL)}\n"
         f"Running first analysis now..."
     )
 
-    # ── Scheduler — start BEFORE morning_job ─────────
     scheduler = BackgroundScheduler(timezone=IST)
 
     scheduler.add_job(
@@ -1621,19 +2066,17 @@ def main():
         id="closing"
     )
 
-    scheduler.start()   # ← Pahile start
+    scheduler.start()
     log.info("✅ Scheduler started")
     log.info("   First analysis    : 9:20 IST")
     log.info("   Hourly reanalysis : :02 of each hour")
     log.info("   Zone monitor      : Every 5min :10sec")
     log.info("   EOD summary       : 15:30 IST")
 
-    # ── First analysis on startup (after scheduler) ──
     if is_market_open():
         log.info("Market open → running first analysis now...")
-        morning_job()   # ← Scheduler already running, no warning
+        morning_job()
 
-    # ── Flask ─────────────────────────────────────────
     flask_app = Flask(__name__)
 
     @flask_app.route("/")
@@ -1642,9 +2085,9 @@ def main():
 
     @flask_app.route("/health")
     def health():
-        ctx    = get_morning_context()
-        zones  = get_zones()
-        history= get_signal_history()
+        ctx     = get_morning_context()
+        zones   = get_zones()
+        history = get_signal_history()
         return {
             "status":          "ok",
             "time_ist":        datetime.now(IST).strftime("%d-%m-%Y %H:%M:%S"),
@@ -1652,6 +2095,8 @@ def main():
             "bias":            ctx.get("bias","?") if ctx else "?",
             "zones_active":    len(zones),
             "signals_today":   len(history),
+            "analysis_model":  ANALYSIS_MODEL,
+            "decision_model":  DECISION_MODEL,
             "scheduler":       "running" if scheduler.running else "stopped"
         }, 200
 
